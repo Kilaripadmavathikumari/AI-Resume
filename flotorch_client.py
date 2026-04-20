@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,7 @@ class FloTorchClient:
         self.model = os.getenv("FLOTORCH_MODEL", "claude")
         self.index_id = os.getenv("FLOTORCH_INDEX_ID")
         self.timeout = int(os.getenv("FLOTORCH_TIMEOUT", "60"))
+        self.max_retries = int(os.getenv("FLOTORCH_MAX_RETRIES", "3"))
 
     def _build_payload(self, system_prompt: str, user_prompt: str) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -68,17 +70,40 @@ class FloTorchClient:
         }
         payload = self._build_payload(system_prompt=system_prompt, user_prompt=user_prompt)
 
-        try:
-            response = requests.post(
-                self.api_url,
-                json=payload,
-                headers=headers,
-                timeout=self.timeout,
-            )
-            response.raise_for_status()
-        except requests.HTTPError as exc:
-            raise RuntimeError(f"FloTorch API error: {exc}") from exc
-        except requests.RequestException as exc:
-            raise RuntimeError(f"FloTorch request failed: {exc}") from exc
+        response: requests.Response | None = None
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                response = requests.post(
+                    self.api_url,
+                    json=payload,
+                    headers=headers,
+                    timeout=self.timeout,
+                )
+
+                # Retry temporary upstream gateway issues before surfacing the failure.
+                if response.status_code in {502, 503, 504} and attempt < self.max_retries:
+                    time.sleep(min(2 ** (attempt - 1), 4))
+                    continue
+
+                response.raise_for_status()
+                break
+            except requests.HTTPError as exc:
+                status_code = exc.response.status_code if exc.response is not None else "unknown"
+                response_text = (exc.response.text or "").strip() if exc.response is not None else ""
+                if status_code in {502, 503, 504} and attempt < self.max_retries:
+                    time.sleep(min(2 ** (attempt - 1), 4))
+                    continue
+                details = f"FloTorch API error ({status_code}): {exc}"
+                if response_text:
+                    details += f"\nResponse body: {response_text[:500]}"
+                raise RuntimeError(details) from exc
+            except requests.RequestException as exc:
+                if attempt < self.max_retries:
+                    time.sleep(min(2 ** (attempt - 1), 4))
+                    continue
+                raise RuntimeError(f"FloTorch request failed: {exc}") from exc
+
+        if response is None:
+            raise RuntimeError("FloTorch request failed before receiving a response.")
 
         return self._parse_response(response.json())
